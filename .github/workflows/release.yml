@@ -61,6 +61,8 @@ jobs:
 
       - name: Setup Node.js and pnpm
         uses: ./.github/actions/setup-node-pnpm
+        with:
+          cache-enabled: 'false'
 
       - name: Read release metadata
         id: meta

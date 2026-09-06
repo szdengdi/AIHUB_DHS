@@ -10,6 +10,10 @@ inputs:
     description: Dependency lockfile used for the pnpm cache key
     required: false
     default: pnpm-lock.yaml
+  cache-enabled:
+    description: Whether to enable pnpm cache for setup-node (set to false for jobs that do not install dependencies)
+    required: false
+    default: 'true'
 
 runs:
   using: composite
@@ -22,5 +26,5 @@ runs:
       uses: actions/setup-node@v7
       with:
         node-version: ${{ inputs.node-version }}
-        cache: pnpm
+        cache: ${{ inputs.cache-enabled == 'true' && 'pnpm' || '' }}
         cache-dependency-path: ${{ inputs.cache-dependency-path }}
