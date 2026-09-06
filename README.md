@@ -143,7 +143,7 @@ brew install dsh-tauri-desk/desktop/deepseek-harness
         http://127.0.0.1:3080/  ← 内嵌界面
 ```
 
-Harness 发行版由 [deepseek-harness-pkg](https://github.com/dsh-tauri-desk/deepseek-harness-pkg) 构建发布。每次启动都会对比最新发行版，本地过期时提醒下载更新；GitHub 不可达时保留本地安装。通过 CLI 全局安装的本地核心会被优先使用。
+Harness 发行版由 [dsh-cmi](https://github.com/szdengdi/dsh-cmi)（CMI AI Hub 定制版 pkg 仓库）构建发布。每次启动都会对比最新发行版，本地过期时提醒下载更新；GitHub 不可达时保留本地安装。通过 CLI 全局安装的本地核心会被优先使用。
 
 ## 说明
 
@@ -156,7 +156,7 @@ Harness 发行版由 [deepseek-harness-pkg](https://github.com/dsh-tauri-desk/de
 ## 相关项目
 
 - [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) — 上游 `dsh` agent 平台
-- [deepseek-harness-pkg](https://github.com/dsh-tauri-desk/deepseek-harness-pkg) — 预打包 Harness 发行版（本应用下载源）
+- [dsh-cmi](https://github.com/szdengdi/dsh-cmi) — 预打包 Harness 发行版（本应用下载源，CMI AI Hub 定制版）
 - [n8n-desktop](https://github.com/tangtao646/n8n-desktop) — 参考实现
 
 ## License
