@@ -31,10 +31,10 @@ const PROVIDER_BASE_URL: &str = "https://mcloud-aihub.cmi.chinamobile.com/v1/";
 const PROVIDER_API: &str = "openai-completions";
 /// API Key 环境变量名：用户需在系统环境变量中设置（如 `CMI_AIHUB_API_KEY=sk-...`）。
 const API_KEY_ENV: &str = "CMI_AIHUB_API_KEY";
-/// 默认模型 id（占位：按 CMI AI Hub 实际开放的模型调整，见 README 说明）。
-const DEFAULT_MODEL_ID: &str = "deepseek-v4-flash";
+/// 默认模型 id（CMI AI Hub 实际开放的模型）。
+const DEFAULT_MODEL_ID: &str = "azure/gpt-5-nano";
 /// 默认模型显示名。
-const DEFAULT_MODEL_NAME: &str = "DeepSeek V4 Flash";
+const DEFAULT_MODEL_NAME: &str = "GPT-5 Nano (Azure)";
 /// 默认上下文窗口（token）。
 const DEFAULT_CONTEXT_WINDOW: u64 = 131_072;
 /// 默认最大输出 token。
@@ -223,7 +223,7 @@ mod tests {
         let content = fs::read_to_string(dir.join("cordis.patch.yml")).unwrap();
         assert!(content.contains("agent-default-model"));
         assert!(content.contains("provider: cmi-aihub"));
-        assert!(content.contains("model: deepseek-v4-flash"));
+        assert!(content.contains("model: azure/gpt-5-nano"));
 
         // 幂等：再次调用不重复追加
         ensure_home_patch(&dir).unwrap();
