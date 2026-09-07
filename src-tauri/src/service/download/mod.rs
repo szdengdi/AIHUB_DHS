@@ -2,6 +2,7 @@ mod core;
 mod extractor;
 mod github;
 mod installable;
+mod offline;
 mod progress;
 mod utils;
 
@@ -16,6 +17,8 @@ pub use github::{
 };
 // 供核心面板切换版本时使用（跨模块内部接口，不进公共 API）
 pub(crate) use core::{remove_dir_with_retry, rename_with_retry};
+// 安装包内置离线资源查找（安装/自愈流程使用）
+pub use offline::{dsh_offline_available, offline_filename, offline_resource_path};
 #[cfg(windows)]
 pub use installable::Git;
 pub use installable::{Dsh, InstallKind, Installable, Nodejs, Pnpm};

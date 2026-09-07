@@ -905,7 +905,7 @@ dependencies = [
 
 [[package]]
 name = "deepseek-harness-desktop"
-version = "0.10.6"
+version = "0.10.7"
 dependencies = [
  "arboard",
  "async-trait",

@@ -134,6 +134,7 @@ pub async fn install_dependencies(app_handle: AppHandle) -> Result<bool, String>
     // latest 可能是 alpha/beta 等超出推荐范围的预览版；并且 `/releases/latest`
     // 不保证与推荐版本的摘要属于同一 release。按推荐 SemVer 反查固定 tag，后续
     // 资产 URL 与 digest 都从该 tag 获取。
+    // 离线定制版：安装包内置 dsh 资源时跳过联网核对，直接使用内置资源。
     let recommended_version = config::recommended_dsh_version(&app_handle);
     let installed_version = dsh_files_ok
         .then(|| active_dsh_version(&app_handle))
@@ -145,6 +146,9 @@ pub async fn install_dependencies(app_handle: AppHandle) -> Result<bool, String>
             "Keeping installed dsh version above recommendation: {}",
             installed_version.as_deref().unwrap_or_default()
         );
+        None
+    } else if download::dsh_offline_available(&app_handle) {
+        log::info!("Bundled offline dsh resource available, skipping online version check");
         None
     } else {
         Some(match recommended_version {
@@ -159,7 +163,9 @@ pub async fn install_dependencies(app_handle: AppHandle) -> Result<bool, String>
     // 很容易留下破损安装，导致启动报找不到 @deepseek-ai/dsh-client-ui-settings
     // 或 HARNESS_NOT_FOUND。仅在真更新（UpdateAvailable）时才允许重新下载。
     let dsh_need_install = match dsh_latest.as_ref() {
-        None => false,
+        // 离线模式（或保留更高版本）：无 release 元数据。离线模式下核心文件
+        // 缺失时仍需安装（从内置资源解压）；保留更高版本时文件必然在盘。
+        None => !dsh_files_ok,
         Some(Ok(latest)) if dsh_files_ok => {
             let record_commit = config::get_dsh_pkg_commit(&app_handle);
             let record_tag = config::get_dsh_pkg_tag(&app_handle);
@@ -258,63 +264,12 @@ pub async fn install_dependencies(app_handle: AppHandle) -> Result<bool, String>
 
 /// 静默检查是否有新版 Harness 可用（只查不装，供进入页面后后台调用）
 ///
-/// 以“实际安装文件”为准核对，而不是只看本地记录：记录可能因安装时 API
-/// 失败或外围途径更新而滞后于文件，此时修正记录并免打扰；同版本热修
-/// （版本相同但 commit 不同）仍正常提示。
+/// 离线定制版：安装包内置固定版本核心，不检查 dsh 核心更新，恒返回 None。
 #[tauri::command]
 pub async fn check_dsh_update(
-    app_handle: AppHandle,
+    _app_handle: AppHandle,
 ) -> Result<Option<download::LatestDshPkg>, String> {
-    // 本地没有安装时无需提示更新
-    let dsh_files_ok = download::Dsh.check_installed(&app_handle);
-    if !dsh_files_ok {
-        return Ok(None);
-    }
-
-    // 当前运行的是预览版时不提示稳定/RC 更新：预览版可能高于当前 release，
-    // 但不能把用户主动选择的 alpha/beta 版本降级成较旧的 rc。
-    if config::get_store_dat_setting(&app_handle)
-        .active_core
-        .as_deref()
-        == Some("app")
-        && config::get_dsh_pkg_tag(&app_handle)
-            .as_deref()
-            .is_some_and(download::is_preview_tag)
-    {
-        log::info!("Suppressing dsh update because a preview core is active");
-        return Ok(None);
-    }
-
-    let latest = download::fetch_latest_dsh_pkg_info().await?;
-
-    // 关键修复1：最新 release 的版本号已经在已装核心列表里（含 active 和非 active
-    // 槽位），就不提示更新。避免「老版本激活 + 新版已下载但未切换」场景下白点一次
-    // 「立即更新」做整包重下——版本号（用户视角的版本）已经在那了，没必要再拉一遍。
-    if let Some(version) = download::parse_version_from_tag(&latest.tag) {
-        if core::has_installed_version(&app_handle, &version).await {
-            log::info!(
-                "Suppressing dsh update toast because latest version is already installed: {}",
-                version
-            );
-            return Ok(None);
-        }
-    }
-
-    // 关键修复2：最新 release 高于推荐版本时（通常是 alpha/beta/preview 序号
-    // 大于稳定 RC）不自动推。stable 用户不该被打扰去装 alpha 测试版；用户想追
-    // preview 自行去核心面板下载。这条规则先于「installed 比 latest 低」检查，
-    // 否则装了 0.1.1-rc.1 的用户会被弹 0.1.3-alpha.1 更新。
-    if let Some(version) = download::parse_version_from_tag(&latest.tag) {
-        if config::is_dsh_version_above_recommended(&app_handle, &version) {
-            log::info!(
-                "Suppressing dsh update toast because latest is above recommended (preview/alpha): {}",
-                version
-            );
-            return Ok(None);
-        }
-    }
-
-    Ok(Some(latest))
+    Ok(None)
 }
 
 /// 启动 Harness 服务

@@ -8,7 +8,7 @@ import {
   Square,
   Xmark,
 } from '@gravity-ui/icons'
-import { Button, Chip, Description, Dropdown, Label } from '@heroui/react'
+import { Button, Chip, Dropdown, Label } from '@heroui/react'
 import { useOverlay } from '@overlastic/react'
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
@@ -16,10 +16,8 @@ import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { If } from 'react-if-lite'
 import { cn } from 'tailwind-variants'
-import { useStore } from 'valtio-define'
 import { ConfigDialog } from '@/components/config-dialog'
 import { DesktopAboutDialog } from '@/components/desktop-about-dialog'
-import { DesktopUpdateDialog } from '@/components/desktop-update-dialog'
 import { useDshPlugins } from '@/hooks/use-dsh-plugins'
 import { useIframeTauri } from '@/hooks/use-iframe-tauri'
 import { store } from '@/store'
@@ -122,11 +120,9 @@ export function Navbar({ iframeRef }: NavbarProps) {
   const isFullscreen = useMacOSFullscreen()
   const { plugins } = useDshPlugins()
   const { sidebarCollapsed, canGoBack, canGoForward, sendNav } = useIframeTauri(iframeRef)
-  const { updateInfo } = useStore(store.desktopUpdater)
 
   const openConfigDialog = useOverlay(ConfigDialog)
   const openAboutDialog = useOverlay(DesktopAboutDialog)
-  const openUpdateDialog = useOverlay(DesktopUpdateDialog)
   // 仅当 dsh-tauri 插件启用（已安装）时显示左侧导航控件
   const tauriEnabled = plugins.some(plugin => plugin.id === TAURI_PLUGIN_ID)
   function handleWindowAction(action: 'minimize' | 'maximize' | 'background') {
@@ -163,9 +159,7 @@ export function Navbar({ iframeRef }: NavbarProps) {
   }
 
   function handleHelpAction(key: string) {
-    if (key === 'check-update')
-      void handleCheckUpdate()
-    else if (key === 'about')
+    if (key === 'about')
       void openAboutDialog().catch(() => {})
     else if (key === 'copy-run-logs')
       void copyRunLogs()
@@ -177,21 +171,6 @@ export function Navbar({ iframeRef }: NavbarProps) {
 
   function handleOpenAbout() {
     void openAboutDialog().catch(() => {})
-  }
-
-  /** 「检查更新」：先检查，有更新才弹框；检查失败提示错误而非「已是最新」 */
-  async function handleCheckUpdate() {
-    try {
-      const info = await store.desktopUpdater.check()
-      if (info)
-        void openUpdateDialog().catch(() => {})
-      else
-        toast(t('update.up_to_date'), {})
-    }
-    catch (err) {
-      console.warn('[Navbar] check update failed:', err)
-      toast(t('update.check_failed'), { variant: 'danger' })
-    }
   }
 
   async function copyRunLogs() {
@@ -211,7 +190,6 @@ export function Navbar({ iframeRef }: NavbarProps) {
     openConfig: handleOpenConfig,
     openAbout: handleOpenAbout,
     copyRunLogs: () => { void copyRunLogs() },
-    checkUpdate: () => { void handleCheckUpdate() },
     restartHarness: () => { void store.harness.restart() },
   })
 
@@ -293,19 +271,6 @@ export function Navbar({ iframeRef }: NavbarProps) {
                   onAction={() => handleHelpAction('copy-run-logs')}
                 >
                   <Label>{t('menu.run_logs')}</Label>
-                </Dropdown.Item>
-                <Dropdown.Item
-                  className="rounded-md"
-                  id="check-update"
-                  textValue={t('menu.check_update')}
-                  onAction={() => handleHelpAction('check-update')}
-                >
-                  <span className="flex w-full items-center justify-between gap-3">
-                    <Label>{t('menu.check_update')}</Label>
-                    <If cond={updateInfo != null}>
-                      <Description>{t('menu.new_version')}</Description>
-                    </If>
-                  </span>
                 </Dropdown.Item>
                 <Dropdown.Item
                   className="rounded-md"

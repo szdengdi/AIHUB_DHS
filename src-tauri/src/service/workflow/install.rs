@@ -55,8 +55,9 @@ pub async fn install(
     // 必须在下载前解析 release 元数据：下载地址和摘要必须属于同一固定 tag。
     // 若先下载 latest、再因 API 限流从 Atom/HTML 解析 tag，latest 在两次请求间
     // 发生切换就会把另一份资产拿来匹配摘要，最终触发 INTEGRITY_CHECK_FAILED。
+    // 离线定制版：安装包内置 dsh 资源时无需联网核对版本，直接使用内置资源。
     let dsh_missing = !download::Dsh.check_installed(app_handle);
-    if dsh_latest.is_none() && dsh_missing {
+    if dsh_latest.is_none() && dsh_missing && !download::dsh_offline_available(app_handle) {
         for attempt in 0..3 {
             let metadata = match config::recommended_dsh_version(app_handle) {
                 Some(version) => download::fetch_dsh_pkg_version(&version).await,
@@ -135,7 +136,7 @@ pub async fn install(
 
         log::info!("Task {} not installed, starting installation", index + 1);
 
-        // 1. 下载
+        // 1. 下载（离线定制版：安装包内置资源时直接读取，不联网）
         tracker.start_phase(
             "download",
             &format!(
@@ -144,60 +145,84 @@ pub async fn install(
                 task.title()
             ),
         );
-        // 下载 URL 对 dsh 也是完全确定可算的（DSH_CORE_URL + 平台文件名），
-        // 无需依赖 GitHub API 元数据；api.github.com 限流/被代理拦截时
-        // （mac 首次启动常见）仍能拿到真实下载地址，避免整次安装被瞬时失败卡死。
-        // dsh 核心默认先走 GitHub 官方直连，失败自动切换 ghfast.top 镜像兜底
-        // （下载层会在界面上告知用户）；其余任务保持单一官方源。
-        let (urls, name) = if kind == download::InstallKind::Dsh {
-            // 摘要与资产必须来自同一个 release。若前面已取得 release 元数据，
-            // 必须使用其中的固定 asset URL；继续请求 `releases/latest` 会在 latest
-            // 发布切换或 CDN 缓存不一致时下载另一份文件，最终表现为摘要 mismatch。
-            let primary = dsh_latest
-                .as_ref()
-                .map(|info| info.asset_url.clone())
-                .filter(|url| !url.is_empty())
-                .unwrap_or(config::get_dsh_download_url()?);
-            let name = primary.rsplit('/').next().unwrap_or("").to_string();
-            let urls = vec![primary.clone(), config::mirror_download_url(&primary)];
-            (urls, name)
+        // 离线资源优先：安装包内置（resources/offline/），存在时直接读取解压，
+        // 跳过网络下载与完整性校验（资源随安装包分发，可信）。
+        let offline_path = download::offline_filename(kind)
+            .and_then(|name| download::offline_resource_path(app_handle, &name));
+        let (buffer, name) = if let Some(path) = offline_path {
+            log::info!("Using bundled offline resource: {:?}", path);
+            tracker.update(
+                100.0,
+                "使用安装包内置资源".into(),
+                format!("Offline {}", path.display()),
+            );
+            let buffer = std::fs::read(&path)
+                .map_err(|e| format!("OFFLINE_RESOURCE_READ_FAILED: {e}"))?;
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            (buffer, name)
         } else {
-            let url = task.get_download_url()?;
-            let name = url.rsplit('/').next().unwrap_or("").to_string();
-            (vec![url], name)
-        };
-        // 取文件名用于解压类型判定；下载 URL 正常必含 '/'，但这里不 panic，
-        // 防御性兜底为空串（后续 ensure_extract 会因无法判定类型而报错返回，
-        // 不再让进程崩溃）。
-        log::debug!("Download URL: {}", urls.join(" -> "));
-        log::debug!("File name: {}", name);
-        let buffer = download::download_file_from_sources(&tracker, urls).await?;
-        log::info!("Download completed, file size: {} bytes", buffer.len());
-        let expected_digest = match kind {
-            download::InstallKind::Node => {
-                download::fetch_node_sha256(task.get_download_url()?.as_str()).await?
-            }
-            download::InstallKind::Dsh => {
-                // 元数据已在安装任务开始前获取，确保下载地址与摘要来自同一 release。
-                dsh_latest
+            // 下载 URL 对 dsh 也是完全确定可算的（DSH_CORE_URL + 平台文件名），
+            // 无需依赖 GitHub API 元数据；api.github.com 限流/被代理拦截时
+            // （mac 首次启动常见）仍能拿到真实下载地址，避免整次安装被瞬时失败卡死。
+            // dsh 核心默认先走 GitHub 官方直连，失败自动切换 ghfast.top 镜像兜底
+            // （下载层会在界面上告知用户）；其余任务保持单一官方源。
+            let (urls, name) = if kind == download::InstallKind::Dsh {
+                // 摘要与资产必须来自同一个 release。若前面已取得 release 元数据，
+                // 必须使用其中的固定 asset URL；继续请求 `releases/latest` 会在 latest
+                // 发布切换或 CDN 缓存不一致时下载另一份文件，最终表现为摘要 mismatch。
+                let primary = dsh_latest
                     .as_ref()
-                    .and_then(|info| info.digest.clone())
-                    .ok_or_else(|| {
-                        "DSH_INTEGRITY_UNAVAILABLE: trusted release digest is required".to_string()
-                    })?
-            }
-            download::InstallKind::Pnpm => config::PNPM_SHA256.to_string(),
-            #[cfg(windows)]
-            download::InstallKind::Git => config::get_mingit_sha256()?.to_string(),
-            #[cfg(not(windows))]
-            download::InstallKind::Git => {
-                return Err(
-                    "INSTALL_TASK_INVALID: Git task not supported on this platform".to_string(),
-                )
-            }
+                    .map(|info| info.asset_url.clone())
+                    .filter(|url| !url.is_empty())
+                    .unwrap_or(config::get_dsh_download_url()?);
+                let name = primary.rsplit('/').next().unwrap_or("").to_string();
+                let urls = vec![primary.clone(), config::mirror_download_url(&primary)];
+                (urls, name)
+            } else {
+                let url = task.get_download_url()?;
+                let name = url.rsplit('/').next().unwrap_or("").to_string();
+                (vec![url], name)
+            };
+            // 取文件名用于解压类型判定；下载 URL 正常必含 '/'，但这里不 panic，
+            // 防御性兜底为空串（后续 ensure_extract 会因无法判定类型而报错返回，
+            // 不再让进程崩溃）。
+            log::debug!("Download URL: {}", urls.join(" -> "));
+            log::debug!("File name: {}", name);
+            let buffer = download::download_file_from_sources(&tracker, urls).await?;
+            log::info!("Download completed, file size: {} bytes", buffer.len());
+            let expected_digest = match kind {
+                download::InstallKind::Node => {
+                    download::fetch_node_sha256(task.get_download_url()?.as_str()).await?
+                }
+                download::InstallKind::Dsh => {
+                    // 元数据已在安装任务开始前获取，确保下载地址与摘要来自同一 release。
+                    dsh_latest
+                        .as_ref()
+                        .and_then(|info| info.digest.clone())
+                        .ok_or_else(|| {
+                            "DSH_INTEGRITY_UNAVAILABLE: trusted release digest is required"
+                                .to_string()
+                        })?
+                }
+                download::InstallKind::Pnpm => config::PNPM_SHA256.to_string(),
+                #[cfg(windows)]
+                download::InstallKind::Git => config::get_mingit_sha256()?.to_string(),
+                #[cfg(not(windows))]
+                download::InstallKind::Git => {
+                    return Err(
+                        "INSTALL_TASK_INVALID: Git task not supported on this platform"
+                            .to_string(),
+                    )
+                }
+            };
+            download::verify_sha256(&buffer, &expected_digest)?;
+            log::info!("Download integrity verified for task {}", index + 1);
+            (buffer, name)
         };
-        download::verify_sha256(&buffer, &expected_digest)?;
-        log::info!("Download integrity verified for task {}", index + 1);
         tracker.end_phase();
 
         // 2. 解压

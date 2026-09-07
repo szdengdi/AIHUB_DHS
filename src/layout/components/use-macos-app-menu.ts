@@ -5,7 +5,7 @@ interface MacOSAppMenuActions {
   openConfig: () => void
   openAbout: () => void
   copyRunLogs: () => void
-  checkUpdate: () => void
+  checkUpdate?: () => void
   restartHarness: () => void
 }
 
@@ -55,7 +55,7 @@ export function useMacOSAppMenu({
               actionsRef.current.copyRunLogs()
               break
             case 'desktop-check-update':
-              actionsRef.current.checkUpdate()
+              actionsRef.current.checkUpdate?.()
               break
             case 'desktop-restart':
               actionsRef.current.restartHarness()

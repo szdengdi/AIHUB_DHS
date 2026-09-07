@@ -7,11 +7,13 @@ use crate::service::update;
 use tauri::AppHandle;
 
 /// 检查桌面端自身是否有新版本（含安装包是否已下载）
+///
+/// 离线定制版：不检查桌面端更新，恒返回 None。
 #[tauri::command]
 pub async fn check_desktop_update(
-    app_handle: AppHandle,
+    _app_handle: AppHandle,
 ) -> Result<Option<update::DesktopUpdateInfo>, String> {
-    update::check(&app_handle).await
+    Ok(None)
 }
 
 /// 下载桌面端新版本安装包；已下载则直接返回。进度通过 `desktop-update-progress` 事件推送

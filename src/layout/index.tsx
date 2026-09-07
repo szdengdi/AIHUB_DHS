@@ -4,7 +4,6 @@ import { useStore } from 'valtio-define'
 import { PluginRecovery } from '../components/plugin-recovery'
 import { useDshTheme } from '../hooks/use-dsh-theme'
 import { store } from '../store'
-import { DesktopUpdater } from './components/desktop-updater'
 import { DownloadToast } from './components/download-toast-trigger'
 import { HarnessUpdater } from './components/harness-updater'
 import { Webview } from './components/webview'
@@ -70,7 +69,6 @@ export function App() {
       <If cond={status === 'ready'}>
         <PluginRecovery />
       </If>
-      <DesktopUpdater />
     </div>
   )
 }

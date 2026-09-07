@@ -23,7 +23,6 @@ import { internalPluginReason } from '@/utils/internal-plugin-phase'
 import { containsInotifyLimitError, pickErrorLines } from '@/utils/log'
 import { BoundedReloadGate, pollReadiness, SingleFlight, waitForActivityTask } from '@/utils/readiness'
 import { runtimeExitMessageKey, shouldAcceptRuntimeExit } from '@/utils/runtime-exit'
-import { harnessUpdater } from '../harness-updater'
 
 const IFRAME_LOAD_TIMEOUT = 20000
 const HEALTH_PROBE_INITIAL_INTERVAL = 1000
@@ -741,10 +740,6 @@ export const harness = defineStore({
 
         if (token !== bootToken)
           return
-        // 已安装时后台静默检查新版，发现后提示用户
-        if (config.installed) {
-          void harnessUpdater.checkForUpdate()
-        }
       }
       catch (err) {
         if (token !== bootToken)
@@ -1090,10 +1085,9 @@ export const harness = defineStore({
       }
     },
 
-    /** 预装引导结束后的收尾：拉起服务等待就绪，并静默检查更新 */
+    /** 预装引导结束后的收尾：拉起服务等待就绪 */
     async continueAfterPreinstall() {
       await this.launchAndWait()
-      void harnessUpdater.checkForUpdate()
     },
 
     /**
