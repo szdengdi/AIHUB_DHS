@@ -79,6 +79,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Validate signing secrets
+        id: validate
         if: steps.check.outputs.should_run == 'true'
         shell: bash
         env:
@@ -93,8 +94,10 @@ jobs:
             [ -z "${!name}" ] && missing+=("$name")
           done
           if [ "${#missing[@]}" -ne 0 ]; then
-            echo "::error::Missing macOS signing secrets: ${missing[*]}"
-            exit 1
+            echo "::warning::macOS signing secrets missing (${missing[*]}); building unsigned (ad-hoc) package"
+            echo "signing_available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "signing_available=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build package
@@ -117,6 +120,10 @@ jobs:
           if [ -z "$app_path" ]; then
             echo '::error::Built macOS app bundle was not found'
             exit 1
+          fi
+          if [ "${{ steps.validate.outputs.signing_available }}" != 'true' ]; then
+            echo '::warning::Skipping codesign/notarization verification (unsigned build)'
+            exit 0
           fi
           codesign --verify --deep --strict --verbose=2 "$app_path"
           xcrun stapler validate "$app_path"
