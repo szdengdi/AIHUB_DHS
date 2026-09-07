@@ -42,8 +42,6 @@ const DEFAULT_MAX_TOKENS: u64 = 8_192;
 
 /// settings.yaml 注入判定标记：出现该字符串即视为已注入。
 const SETTINGS_MARKER: &str = "cmi-aihub";
-/// cordis.patch.yml 注入判定标记：出现该字符串即视为已注入。
-const PATCH_MARKER: &str = "agent-default-model";
 
 /// 幂等地确保 CMI AI Hub 默认提供方配置已注入 `$DSH_HOME`。
 ///
@@ -120,57 +118,118 @@ fn ensure_settings(dsh_home: &Path) -> Result<(), String> {
 }
 
 /// 写入 `$DSH_HOME/cordis.patch.yml`（home 级）的 `agent-default-model` 覆盖行。
+///
+/// 必须使用 id-targeted patch（`- id: agent-default-model` + `config`），不能使用
+/// `- insert:`：bundle 层（dsh-base / dsh-cmi 的 cordis.patch.yml）已经 insert 了
+/// `agent-default-model` 行，home 层再用 insert 会在 `mountRootInclude` 阶段触发
+/// `duplicate loader entry id: agent-default-model`（0.10.7 实测，dsh 启动直接失败）。
+/// id-targeted patch 按 id 覆盖 bundle 行，patch 栈「bundle → profile → home →
+/// overlay」最后写入者胜出，不会产生重复 entry。
+///
+/// 迁移：0.10.7 曾写入 insert 块（特征：insert 数组含 id: agent-default-model 且
+/// config.provider == cmi-aihub），本函数检测到即移除并改写为 id-targeted patch；
+/// 用户自己写的 agent-default-model 条目（provider 非 cmi-aihub 的 insert，或
+/// id-targeted patch）一律保留，绝不覆盖用户配置。
 fn ensure_home_patch(dsh_home: &Path) -> Result<(), String> {
     let path = dsh_home.join("cordis.patch.yml");
-    if path.exists() {
-        let content = fs::read_to_string(&path).map_err(|e| format!("read failed: {e}"))?;
-        if content.contains(PATCH_MARKER) {
-            return Ok(()); // 已注入，跳过
-        }
-    }
+    let existing = fs::read_to_string(&path).unwrap_or_default();
 
-    // 顶层数组：已有内容追加一个 `- insert:` 元素；不存在则新建。
-    let mut list: serde_yaml::Value = if path.exists() {
-        let content = fs::read_to_string(&path).map_err(|e| format!("read failed: {e}"))?;
-        if content.trim().is_empty() {
-            serde_yaml::Value::Sequence(Vec::new())
-        } else {
-            let doc: serde_yaml::Value =
-                serde_yaml::from_str(&content).map_err(|e| format!("parse failed: {e}"))?;
-            match doc {
-                serde_yaml::Value::Sequence(_) => doc,
-                serde_yaml::Value::Null => serde_yaml::Value::Sequence(Vec::new()),
-                _ => return Err("cordis.patch.yml must be a top-level array".to_string()),
-            }
-        }
-    } else {
+    // 顶层数组：空/纯注释视为空数组。
+    let mut list: serde_yaml::Value = if existing.trim().is_empty() {
         serde_yaml::Value::Sequence(Vec::new())
-    };
-
-    let insert = serde_yaml::from_str::<serde_yaml::Value>(&format!(
-        "- insert:\n\
-         \x20   - id: agent-default-model\n\
-         \x20     name: '@deepseek-ai/dsh-agent-default-model'\n\
-         \x20     config:\n\
-         \x20       provider: {PROVIDER_ID}\n\
-         \x20       model: {DEFAULT_MODEL_ID}\n"
-    ))
-    .map_err(|e| format!("patch yaml failed: {e}"))?;
-    // `- insert:` 解析为单元素序列，取出其中的映射元素作为顶层数组项。
-    let insert = match insert {
-        serde_yaml::Value::Sequence(mut s) if s.len() == 1 => s.remove(0),
-        other => other,
+    } else {
+        let doc: serde_yaml::Value =
+            serde_yaml::from_str(&existing).map_err(|e| format!("parse failed: {e}"))?;
+        match doc {
+            serde_yaml::Value::Sequence(_) => doc,
+            serde_yaml::Value::Null => serde_yaml::Value::Sequence(Vec::new()),
+            _ => return Err("cordis.patch.yml must be a top-level array".to_string()),
+        }
     };
 
     let seq = list
         .as_sequence_mut()
         .ok_or_else(|| "cordis.patch.yml must be a sequence".to_string())?;
-    seq.push(insert);
+
+    // 1) 移除 0.10.7 写入的 insert 块；2) 用户自己的 agent-default-model 条目保留；
+    // 3) 其余条目原样保留。
+    let mut has_user_entry = false;
+    let mut has_our_insert = false;
+    let retained: Vec<serde_yaml::Value> = seq
+        .iter()
+        .filter(|el| {
+            if block_is_our_insert(el) {
+                has_our_insert = true;
+                return false; // 移除我们 0.10.7 写入的 insert 块
+            }
+            if block_targets_agent_default_model(el) {
+                has_user_entry = true;
+            }
+            true
+        })
+        .cloned()
+        .collect();
+    *seq = retained;
+
+    // 用户已有自己的 agent-default-model 配置：保留原样；仅当移除了我们的
+    // insert 块时才需要写回（其余情况无变化，不写盘、保留用户注释）。
+    if has_user_entry {
+        if has_our_insert {
+            let out = serde_yaml::to_string(&list).map_err(|e| format!("render failed: {e}"))?;
+            write_file(&path, &out)?;
+            log::info!("cmi-aihub: 已移除 0.10.7 遗留的 agent-default-model insert 块");
+        }
+        return Ok(());
+    }
+
+    // 追加 id-targeted patch（覆盖 bundle 层的 insert，不产生重复 entry）。
+    let patch = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+        "- id: agent-default-model\n\
+         \x20 config:\n\
+         \x20   provider: {PROVIDER_ID}\n\
+         \x20   model: {DEFAULT_MODEL_ID}\n"
+    ))
+    .map_err(|e| format!("patch yaml failed: {e}"))?;
+    // `- id: ...` 解析为单元素序列，取出其中的映射元素作为顶层数组项。
+    let patch = match patch {
+        serde_yaml::Value::Sequence(mut s) if s.len() == 1 => s.remove(0),
+        other => other,
+    };
+    seq.push(patch);
 
     let out = serde_yaml::to_string(&list).map_err(|e| format!("render failed: {e}"))?;
     write_file(&path, &out)?;
-    log::info!("cmi-aihub: cordis.patch.yml 已注入默认模型提供方 {PROVIDER_ID}");
+    log::info!("cmi-aihub: cordis.patch.yml 已注入默认模型提供方 {PROVIDER_ID} (id-targeted patch)");
     Ok(())
+}
+
+/// 顶层数组元素是否为 0.10.7 写入的 `- insert:` 块（agent-default-model + cmi-aihub）。
+fn block_is_our_insert(el: &serde_yaml::Value) -> bool {
+    let Some(inserts) = el.get("insert").and_then(|v| v.as_sequence()) else {
+        return false;
+    };
+    inserts.iter().any(|e| {
+        e.get("id").and_then(|v| v.as_str()) == Some("agent-default-model")
+            && e.get("config")
+                .and_then(|c| c.get("provider"))
+                .and_then(|v| v.as_str())
+                == Some(PROVIDER_ID)
+    })
+}
+
+/// 顶层数组元素是否为针对 `agent-default-model` 的条目（insert 或 id-targeted patch）。
+fn block_targets_agent_default_model(el: &serde_yaml::Value) -> bool {
+    if el.get("id").and_then(|v| v.as_str()) == Some("agent-default-model") {
+        return true; // id-targeted patch
+    }
+    el.get("insert")
+        .and_then(|v| v.as_sequence())
+        .map(|inserts| {
+            inserts
+                .iter()
+                .any(|e| e.get("id").and_then(|v| v.as_str()) == Some("agent-default-model"))
+        })
+        .unwrap_or(false)
 }
 
 /// 写入文件并创建父目录。
@@ -214,21 +273,89 @@ mod tests {
     }
 
     #[test]
-    fn home_patch_appends_insert_block() {
+    fn home_patch_appends_id_targeted_patch() {
         let dir = std::env::temp_dir().join(format!("cmi-aihub-patch-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
         ensure_home_patch(&dir).unwrap();
         let content = fs::read_to_string(dir.join("cordis.patch.yml")).unwrap();
-        assert!(content.contains("agent-default-model"));
+        assert!(content.contains("id: agent-default-model"));
         assert!(content.contains("provider: cmi-aihub"));
         assert!(content.contains("model: azure/gpt-5-nano"));
+        // 必须用 id-targeted patch，不能是 insert（bundle 层已 insert，再 insert 会 duplicate）
+        assert!(!content.contains("insert:"), "home patch must not use insert, got:\n{content}");
 
         // 幂等：再次调用不重复追加
         ensure_home_patch(&dir).unwrap();
         let content2 = fs::read_to_string(dir.join("cordis.patch.yml")).unwrap();
         assert_eq!(content.matches("agent-default-model").count(), content2.matches("agent-default-model").count());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn home_patch_migrates_legacy_insert_block() {
+        let dir = std::env::temp_dir().join(format!("cmi-aihub-migrate-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // 0.10.7 写入的 insert 块（duplicate loader entry 根因）
+        fs::write(
+            dir.join("cordis.patch.yml"),
+            "- insert:\n    - id: agent-default-model\n      name: '@deepseek-ai/dsh-agent-default-model'\n      config:\n        provider: cmi-aihub\n        model: azure/gpt-5-nano\n",
+        )
+        .unwrap();
+
+        ensure_home_patch(&dir).unwrap();
+        let content = fs::read_to_string(dir.join("cordis.patch.yml")).unwrap();
+        assert!(!content.contains("insert:"), "legacy insert block must be removed, got:\n{content}");
+        assert!(content.contains("id: agent-default-model"));
+        assert!(content.contains("provider: cmi-aihub"));
+
+        // 幂等：再次调用不再变化
+        ensure_home_patch(&dir).unwrap();
+        let content2 = fs::read_to_string(dir.join("cordis.patch.yml")).unwrap();
+        assert_eq!(content, content2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn home_patch_preserves_user_entry() {
+        let dir = std::env::temp_dir().join(format!("cmi-aihub-user-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // 用户自己的 id-targeted patch（provider 非 cmi-aihub）
+        fs::write(
+            dir.join("cordis.patch.yml"),
+            "- id: agent-default-model\n  config:\n    provider: deepseek-official\n    model: deepseek-v4-flash\n",
+        )
+        .unwrap();
+
+        ensure_home_patch(&dir).unwrap();
+        let content = fs::read_to_string(dir.join("cordis.patch.yml")).unwrap();
+        assert!(content.contains("provider: deepseek-official"));
+        assert!(!content.contains("provider: cmi-aihub"), "user config must not be overwritten, got:\n{content}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn home_patch_preserves_user_insert() {
+        let dir = std::env::temp_dir().join(format!("cmi-aihub-userins-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // 用户自己的 insert 块（provider 非 cmi-aihub）
+        fs::write(
+            dir.join("cordis.patch.yml"),
+            "- insert:\n    - id: agent-default-model\n      name: '@deepseek-ai/dsh-agent-default-model'\n      config:\n        provider: deepseek-official\n        model: deepseek-v4-flash\n",
+        )
+        .unwrap();
+
+        ensure_home_patch(&dir).unwrap();
+        let content = fs::read_to_string(dir.join("cordis.patch.yml")).unwrap();
+        assert!(content.contains("provider: deepseek-official"));
+        assert!(!content.contains("provider: cmi-aihub"), "user insert must not be overwritten, got:\n{content}");
 
         let _ = fs::remove_dir_all(&dir);
     }
