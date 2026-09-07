@@ -107,6 +107,11 @@ pub(crate) async fn ensure_preset_plugins(app_handle: &AppHandle) -> Result<(), 
     // 记录错误标记，让前端插件面板暴露问题、用户可走卸载兜底恢复。
     if let Err(e) = repair_with_pnpm_install(app_handle, &profile).await {
         log::warn!("PRESET_PLUGIN_REPAIR_FAILED: {e}");
+        // 离线/无 pnpm 环境下无法重建依赖图：清理缺失插件的引用
+        // （package.json 的 dependencies/bundles + cordis.patch.yml 挂载块），
+        // 否则 dsh 的 loadProfile 会对 bundles 中无法解析的社区插件直接抛
+        // `cannot resolve profile bundle` 而无法启动（0.10.7 实测）。
+        prune_unavailable_plugins(&profile);
         record_missing(app_handle, &missing, &e);
         return Ok(());
     }
@@ -117,12 +122,143 @@ pub(crate) async fn ensure_preset_plugins(app_handle: &AppHandle) -> Result<(), 
         log::info!("preset plugin integrity repaired via pnpm install: {missing:?}");
         return Ok(());
     }
+    // pnpm install 后仍缺失（如离线环境无法下载）：同样清理引用，保证启动。
+    prune_unavailable_plugins(&profile);
     let detail = format!(
         "PRESET_PLUGIN_STILL_MISSING: 修复后仍缺失以下插件产物: {still_missing:?}。可尝试卸载后重新安装。"
     );
     log::warn!("{detail}");
     record_missing(app_handle, &still_missing, &detail);
     Ok(())
+}
+
+/// 清理 profile 中「清单引用但产物缺失」的社区插件：从 package.json 的
+/// dependencies/bundles 移除，并从 cordis.patch.yml 移除对应挂载块。
+///
+/// 只处理非 `@deepseek-ai/` 的包（官方 bundle 由 dsh 安装目录提供，profile
+/// node_modules 缺失是正常布局）；社区插件（dsh-better-sidebar、dshmarket、
+/// dsh-win-terminal-inspector 等）在离线/损坏环境下无法解析时，保留引用会让
+/// dsh 的 loadProfile 直接抛 `cannot resolve profile bundle` 而无法启动。
+/// 最佳努力：任何失败只记日志，不阻断启动。
+fn prune_unavailable_plugins(profile: &Path) {
+    match prune_unavailable_plugins_inner(profile) {
+        Ok(pruned) if !pruned.is_empty() => {
+            log::warn!("PRESET_PLUGIN_PRUNE: 已清理不可用插件引用: {pruned:?}");
+        }
+        Ok(_) => {}
+        Err(e) => log::warn!("PRESET_PLUGIN_PRUNE_FAILED: {e}"),
+    }
+}
+
+/// [`prune_unavailable_plugins`] 的实现；返回被清理的包名列表。
+fn prune_unavailable_plugins_inner(profile: &Path) -> Result<Vec<String>, String> {
+    let manifest_path = profile.join("package.json");
+    let raw = match std::fs::read_to_string(&manifest_path) {
+        Ok(raw) => raw,
+        Err(_) => return Ok(Vec::new()), // 无清单则无需清理
+    };
+    let mut manifest: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("PRUNE_MANIFEST_INVALID: {manifest_path:?}: {e}"))?;
+
+    // 收集引用名（dependencies keys + bundles）。
+    let mut referenced: Vec<String> = Vec::new();
+    if let Some(deps) = manifest.get("dependencies").and_then(|v| v.as_object()) {
+        referenced.extend(deps.keys().cloned());
+    }
+    if let Some(bundles) = manifest
+        .get("dsh")
+        .and_then(|v| v.get("profile"))
+        .and_then(|v| v.get("bundles"))
+        .and_then(|v| v.as_array())
+    {
+        referenced.extend(bundles.iter().filter_map(|v| v.as_str().map(str::to_owned)));
+    }
+
+    // 找出缺失的社区插件（非 @deepseek-ai/ 且 profile node_modules 无产物）。
+    let node_modules = profile.join("node_modules");
+    let mut unavailable: Vec<String> = Vec::new();
+    for name in &referenced {
+        if name.starts_with("@deepseek-ai/") {
+            continue;
+        }
+        if !node_modules.join(name).join("package.json").is_file() {
+            unavailable.push(name.clone());
+        }
+    }
+    if unavailable.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // 从 dependencies 移除。
+    if let Some(deps) = manifest.get_mut("dependencies").and_then(|v| v.as_object_mut()) {
+        for name in &unavailable {
+            deps.remove(name);
+        }
+    }
+    // 从 bundles 移除。
+    if let Some(bundles) = manifest
+        .get_mut("dsh")
+        .and_then(|v| v.get_mut("profile"))
+        .and_then(|v| v.get_mut("bundles"))
+        .and_then(|v| v.as_array_mut())
+    {
+        bundles.retain(|v| {
+            v.as_str()
+                .map(|s| !unavailable.iter().any(|u| u == s))
+                .unwrap_or(true)
+        });
+    }
+
+    // 写回 package.json。
+    let out = serde_json::to_string_pretty(&manifest)
+        .map_err(|e| format!("PRUNE_MANIFEST_RENDER: {e}"))?;
+    std::fs::write(&manifest_path, out + "\n")
+        .map_err(|e| format!("PRUNE_MANIFEST_WRITE: {manifest_path:?}: {e}"))?;
+
+    // 清理 cordis.patch.yml 中对应挂载块。
+    prune_patch_blocks(profile, &unavailable)?;
+
+    Ok(unavailable)
+}
+
+/// 从 profile 的 cordis.patch.yml 移除引用指定包名的 insert 块。
+fn prune_patch_blocks(profile: &Path, names: &[String]) -> Result<(), String> {
+    let patch_path = profile.join("cordis.patch.yml");
+    let existing = match std::fs::read_to_string(&patch_path) {
+        Ok(s) => s,
+        Err(_) => return Ok(()), // 无 patch 文件则无需清理
+    };
+    let doc = match serde_yaml::from_str::<serde_yaml::Value>(&existing) {
+        Ok(d) => d,
+        Err(_) => return Ok(()), // 无法解析则不动原文件
+    };
+    let serde_yaml::Value::Sequence(seq) = doc else {
+        return Ok(());
+    };
+    let original_len = seq.len();
+    let retained: Vec<serde_yaml::Value> = seq
+        .into_iter()
+        .filter(|el| !block_references_any(el, names))
+        .collect();
+    if retained.len() == original_len {
+        return Ok(()); // 无变化
+    }
+    let out = serde_yaml::to_string(&serde_yaml::Value::Sequence(retained))
+        .map_err(|e| format!("PRUNE_PATCH_RENDER: {e}"))?;
+    std::fs::write(&patch_path, out).map_err(|e| format!("PRUNE_PATCH_WRITE: {patch_path:?}: {e}"))
+}
+
+/// 顶层数组元素（insert 块）是否引用指定包名（按 name 字符串包含匹配）。
+fn block_references_any(el: &serde_yaml::Value, names: &[String]) -> bool {
+    let Some(inserts) = el.get("insert").and_then(|v| v.as_sequence()) else {
+        return false;
+    };
+    inserts.iter().any(|e| {
+        let Some(name) = e.get("name").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        names.iter().any(|n| name.contains(n.as_str()))
+    })
 }
 
 /// 在 profile 目录执行 `pnpm install` 修复 node_modules 依赖图。
@@ -384,6 +520,84 @@ mod tests {
         let root = setup("ok", &["dshmarket"]);
         let missing = missing_plugin_ids(&presets, &deps, &bundles, &root.join("node_modules"));
         assert!(missing.is_empty());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn prune_removes_unavailable_plugin_references() {
+        let root = std::env::temp_dir().join(format!(
+            "dsh-verify-prune-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root.join("node_modules")).unwrap();
+        // 清单引用 3 个社区插件（均缺失产物）+ 官方 bundle（由安装目录提供，不清理）
+        fs::write(
+            root.join("package.json"),
+            r#"{
+  "name": "dsh-profile-desktop",
+  "dependencies": {
+    "dshmarket": "github:omdsh-dev/dshmarket",
+    "dsh-win-terminal-inspector": "github:clearkurt/dsh-win-terminal-inspector",
+    "@deepseek-ai/dsh-base": "0.1.2-rc.1"
+  },
+  "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "dsh-better-sidebar"] } }
+}
+"#,
+        )
+        .unwrap();
+        // cordis.patch.yml 含 win-terminal-inspector 挂载块（显式入口写法）
+        fs::write(
+            root.join("cordis.patch.yml"),
+            "- insert:\n    - id: win-terminal-inspector\n      name: ./node_modules/dsh-win-terminal-inspector/index.js\n- id: some-row\n  config:\n    a: 1\n",
+        )
+        .unwrap();
+
+        let pruned = prune_unavailable_plugins_inner(&root).unwrap();
+        assert_eq!(pruned.len(), 3);
+        assert!(pruned.contains(&"dshmarket".to_string()));
+        assert!(pruned.contains(&"dsh-win-terminal-inspector".to_string()));
+        assert!(pruned.contains(&"dsh-better-sidebar".to_string()));
+
+        let manifest = fs::read_to_string(root.join("package.json")).unwrap();
+        assert!(!manifest.contains("dshmarket"));
+        assert!(!manifest.contains("dsh-win-terminal-inspector"));
+        assert!(!manifest.contains("dsh-better-sidebar"));
+        // 官方 bundle 保留
+        assert!(manifest.contains("@deepseek-ai/dsh-base"));
+
+        let patch = fs::read_to_string(root.join("cordis.patch.yml")).unwrap();
+        assert!(!patch.contains("win-terminal-inspector"));
+        assert!(patch.contains("some-row"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn prune_keeps_available_plugins() {
+        let root = std::env::temp_dir().join(format!(
+            "dsh-verify-prune-ok-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        // dshmarket 产物存在
+        fs::create_dir_all(root.join("node_modules/dshmarket")).unwrap();
+        fs::write(root.join("node_modules/dshmarket/package.json"), "{}").unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{
+  "dependencies": { "dshmarket": "github:omdsh-dev/dshmarket" },
+  "dsh": { "profile": { "bundles": ["dshmarket"] } }
+}
+"#,
+        )
+        .unwrap();
+
+        let pruned = prune_unavailable_plugins_inner(&root).unwrap();
+        assert!(pruned.is_empty());
+        let manifest = fs::read_to_string(root.join("package.json")).unwrap();
+        assert!(manifest.contains("dshmarket"));
+
         fs::remove_dir_all(&root).ok();
     }
 
